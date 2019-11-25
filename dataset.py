@@ -1,23 +1,9 @@
-import json
 import os
-import argparse
-from enum import Enum
 
-from PIL import Image
-import numpy as np
-import torch
 from torchvision import datasets, transforms
-from transformers import DistilBertTokenizer, DistilBertModel
-
-from model import ResNet50Encoder
-from nce import LossMultiNCE
+import torch
 
 INTERP = 3
-
-parser = argparse.ArgumentParser()
-parser.add_argument('-b', type=int, default=1)
-args = parser.parse_args()
-
 
 class Transforms128:
     '''
@@ -48,19 +34,35 @@ class Transforms128:
             rnd_gray,
             post_transform
         ])
+        self.raw_trans = transforms.Compose([
+            transforms.Resize(256, interpolation=INTERP),
+            transforms.CenterCrop(256),
+            transforms.ToTensor()
+        ])
+    
+    def __call__(self, inp):
+        inp = self.flip_lr(inp)
+        out1 = self.train_transform(inp)
+        orig = self.raw_trans(inp)
+        return orig, out1
 
 
-def build_dataset(batch_size: int):
+def build_dataset(batch_size: int, stl_batch_size: int):
     transforms128 = Transforms128()
     train_dataset = datasets.CocoCaptions(
                                     root=os.path.expanduser('~/data/coco/train2017'), 
                                     annFile=os.path.expanduser('~/data/coco/annotations/captions_train2017.json'), 
-                                    transform=transforms128.train_transform)
+                                    transform=transforms128)
     
+    print('WARNING: test dataset is using train transforms')
     test_dataset = datasets.CocoCaptions(
                                     root=os.path.expanduser('~/data/coco/val2017'), 
                                     annFile=os.path.expanduser('~/data/coco/annotations/captions_val2017.json'), 
-                                    transform=transforms128.test_transform)
+                                    transform=transforms128)
+    
+    stl_train_dataset = datasets.STL10(root=os.path.expanduser('~/data'), transform=transforms128.test_transform)
+    stl_test_dataset = datasets.STL10(root=os.path.expanduser('~/data'), transform=transforms128.test_transform, split='test')
+
 
     # build pytorch dataloaders for the datasets
     train_loader = \
@@ -77,38 +79,22 @@ def build_dataset(batch_size: int):
                                     pin_memory=True,
                                     drop_last=True,
                                     num_workers=16)
+    
+    stl_train_loader = \
+        torch.utils.data.DataLoader(dataset=stl_train_dataset,
+                                    batch_size=stl_batch_size,
+                                    shuffle=True,
+                                    pin_memory=True,
+                                    drop_last=True,
+                                    num_workers=16)
+    
+    stl_test_loader = \
+        torch.utils.data.DataLoader(dataset=stl_train_dataset,
+                                    batch_size=stl_batch_size,
+                                    shuffle=True,
+                                    pin_memory=True,
+                                    drop_last=True,
+                                    num_workers=16)
 
-    return train_loader, test_loader
+    return train_loader, test_loader, stl_train_loader, stl_test_loader
 
-def build_encoded_ann_file():
-    batch_size = 10
-    train_loader, test_loader = build_dataset(batch_size)
-    tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
-    bert = DistilBertModel.from_pretrained('distilbert-base-uncased')
-
-    i = 0
-    enc_buf = []
-    for _, annotations in train_loader:
-        anns = [a[0] for a in annotations]
-        encodings = [torch.tensor(tokenizer.encode(s)) for s in anns]
-        seq_len = 50
-        padded = torch.stack(
-            [torch.cat([e, torch.zeros((seq_len - len(e)), dtype=torch.long)]) if len(e) < seq_len 
-             else e[:seq_len]
-             for e in encodings])
-        out = bert(padded)
-        # for e in out:
-        #     enc_buf.append(e.tolist())
-        # Encode every annotation and save it somewhere
-        # Compare representation of padded vs non-padded sentence, should be about the same
-        # Do crossproduct of related vs unrelated sentences, related should have a higher score
-        i += batch_size
-        if i % 1000 == 0:
-            print(i)
-            # with open('enc_anns_train.json', 'a+') as f:
-            #     json.dump(enc_buf, f)
-            # enc_buf = []
-    print(i)
-
-if __name__ == "__main__":
-    build_encoded_ann_file()

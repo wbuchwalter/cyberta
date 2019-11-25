@@ -139,9 +139,8 @@ class LossMultiNCE(nn.Module):
         # (bs, 1, 1, rkhs) -> (bs, rkhs)
         r1_src = encoded_image.reshape(batch_size, n_rkhs)
 
-        # (bs, seq_len, 768)
-        #caption_trg = encoded_caption.reshape(768, batch_size * 50)
-        caption_trg = encoded_caption
+        caption_trg = encoded_caption.reshape(batch_size, n_rkhs)
+
         # make masking matrix to help compute nce costs
         mask_mat = torch.eye(batch_size).cuda()
 
@@ -154,3 +153,18 @@ class LossMultiNCE(nn.Module):
         loss_1t5, lgt_reg = self.nce_func(r1_src, caption_trg, mask_mat)
 
         return loss_1t5, lgt_reg
+
+
+def nce_retrieval(encoded_images, encoded_queries, top_k=5):
+    batch_size = encoded_images.size(0)
+    n_rkhs = encoded_images.size(1)
+    n_queries = encoded_queries.size(0)
+
+    # (bs, 1, 1, rkhs) -> (bs, rkhs)
+    encoded_images = encoded_images.reshape(batch_size, n_rkhs)
+    encoded_images = F.normalize(encoded_images)
+
+    scores = torch.mm(encoded_queries, encoded_images.t())
+    cos_sims_idx = torch.sort(scores, dim=1, descending=True)[1]
+    cos_sis_idx = cos_sims_idx[:, :top_k]
+    return cos_sis_idx

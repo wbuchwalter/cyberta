@@ -1,120 +1,29 @@
 import os
 import argparse
 from enum import Enum
+import random 
 
 from PIL import Image
 import numpy as np
 import torch
 import torch.nn as nn
-from torchvision import datasets, transforms
-from transformers import DistilBertTokenizer, DistilBertModel
+from torchvision.utils import make_grid
+
 import wandb
 
 from model import ResNet50Encoder
-from nce import LossMultiNCE
+from dataset import build_dataset
+from nce import LossMultiNCE, nce_retrieval
+from caption_encoder import CaptionEncoder
 
-INTERP = 3
-
-
-wandb.init(project='amdim-bert')
+SEQ_LEN = 20
+N_RKHS = 512
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-b', type=int, default=1)
 args = parser.parse_args()
-
-class Transforms128:
-    '''
-    ImageNet dataset, for use with 128x128 full image encoder.
-    '''
-    def __init__(self):
-        # image augmentation functions
-        self.flip_lr = transforms.RandomHorizontalFlip(p=0.5)
-        rand_crop = \
-            transforms.RandomResizedCrop(128, scale=(0.3, 1.0), ratio=(0.7, 1.4),
-                                         interpolation=INTERP)
-        col_jitter = transforms.RandomApply([
-            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8)
-        rnd_gray = transforms.RandomGrayscale(p=0.25)
-        post_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-        self.test_transform = transforms.Compose([
-            transforms.Resize(146, interpolation=INTERP),
-            transforms.CenterCrop(128),
-            post_transform
-        ])
-        self.train_transform = transforms.Compose([
-            rand_crop,
-            col_jitter,
-            rnd_gray,
-            post_transform
-        ])
-
-
-def build_dataset(batch_size: int):
-    transforms128 = Transforms128()
-    train_dataset = datasets.CocoCaptions(
-                                    root=os.path.expanduser('~/data/coco/train2017'), 
-                                    annFile=os.path.expanduser('~/data/coco/annotations/captions_train2017.json'), 
-                                    transform=transforms128.train_transform)
-    
-    test_dataset = datasets.CocoCaptions(
-                                    root=os.path.expanduser('~/data/coco/val2017'), 
-                                    annFile=os.path.expanduser('~/data/coco/annotations/captions_val2017.json'), 
-                                    transform=transforms128.test_transform)
-    
-    stl_train_dataset = datasets.STL10(root=os.path.expanduser('~/data'), transform=transforms128.test_transform)
-
-    # build pytorch dataloaders for the datasets
-    train_loader = \
-        torch.utils.data.DataLoader(dataset=train_dataset,
-                                    batch_size=batch_size,
-                                    shuffle=True,
-                                    pin_memory=True,
-                                    drop_last=True,
-                                    num_workers=16)
-    test_loader = \
-        torch.utils.data.DataLoader(dataset=test_dataset,
-                                    batch_size=batch_size,
-                                    shuffle=True,
-                                    pin_memory=True,
-                                    drop_last=True,
-                                    num_workers=16)
-    
-    stl_train_loader = \
-        torch.utils.data.DataLoader(dataset=stl_train_dataset,
-                                    batch_size=batch_size,
-                                    shuffle=True,
-                                    pin_memory=True,
-                                    drop_last=True,
-                                    num_workers=16)
-
-    return train_loader, test_loader, stl_train_loader
-
-
-class CaptionEncoder(nn.Module):
-    def __init__(self, n_rkhs, seq_len, device):
-        super(CaptionEncoder, self).__init__()
-        self.seq_len = seq_len
-        self.device = device
-        self.bert = DistilBertModel.from_pretrained('distilbert-base-uncased')
-        self.fc = torch.nn.Sequential(
-            torch.nn.Linear(in_features=seq_len * 768, out_features=seq_len * 768 // 2),
-            torch.nn.ReLU(),
-            torch.nn.Linear(in_features=seq_len * 768 // 2, out_features=n_rkhs)
-        )
-        self.fc.to(device)
-    
-    def forward(self, x, attention_mask):
-        batch_size = x.size(0)
-        out = self.bert(x, attention_mask=attention_mask)[0]
-        out = out.reshape(batch_size, 768 * self.seq_len)
-        out = out.to(self.device)
-        out = self.fc(out)
-        return out
-
+run_id = wandb.init(project='amdim-bert').id
 
 def get_correct_count(lgt_vals, lab_vals):
     # count how many predictions match the target labels
@@ -122,86 +31,98 @@ def get_correct_count(lgt_vals, lab_vals):
     num_correct = (max_lgt == lab_vals).sum().item()
     return num_correct
 
+
+def vizualize(raw_images, encoded_images, raw_queries, encoded_queries):
+    # Reuse the already encoded images from the batch
+    top_k = 5
+    top_k_idx = nce_retrieval(encoded_images, encoded_queries, top_k)
+    top_k_idx = torch.flatten(top_k_idx)
+    matches = raw_images[top_k_idx]
+    viz = make_grid(matches, nrow=top_k)
+    wandb.log({'viz': wandb.Image(viz)})
+    wandb.log({'queries': wandb.Table(data=raw_queries, columns=['Query'])})
+
 def train():
-    n_rkhs = 512
-    seq_len = 50
+    stl_batch_size = 400
+    train_loader, test_loader, stl_train_loader, stl_test_loader = build_dataset(args.b, stl_batch_size)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print('Device: %s' % device)
-    train_loader, test_loader, stl_train_loader = build_dataset(args.b)
-
-
-    tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
-    caption_encoder = CaptionEncoder(n_rkhs, seq_len, device)
-
+    caption_encoder = CaptionEncoder(N_RKHS, SEQ_LEN, device)
     # bert.to(device)
-    resnet50 = ResNet50Encoder(encoder_size=128, n_rkhs=n_rkhs)
+    resnet50 = ResNet50Encoder(encoder_size=128, n_rkhs=N_RKHS)
     resnet50.init_weights()
     resnet50.to(device)
 
-    fc = nn.Linear(in_features=n_rkhs, out_features=10)
+    fc = nn.Linear(in_features=N_RKHS, out_features=10)
     fc = fc.to(device)
 
     optimizer = torch.optim.Adam(
-        [{'params': mod.parameters()} for mod in [caption_encoder, resnet50]],
+        [{'params': mod.parameters(), 'lr': 0.0001} for mod in [caption_encoder.fc, resnet50]],
         betas=(0.8, 0.999), weight_decay=1e-5, eps=1e-8)
     nce = LossMultiNCE().to(device)
 
-    #lin_optimizer = torch.optim.Adam(fc.parameters())
     lin_optimizer = torch.optim.Adam([
-        #{'params': resnet50.parameters()},
         {'params': fc.parameters()}
     ])
 
     fc_loss = nn.CrossEntropyLoss()
     
-    for epoch in range(50):
+    train_encoder = True
+    for epoch in range(500):
         print('epoch %i...' % epoch)
         step = 0
-        for images, annotations in test_loader:
-            images = images.to(device)
-            # annotations = annotations.to(device)
-            anns = annotations[0]  # take the first caption for each image, this could be randomly selected later
-            encodings = [torch.tensor(tokenizer.encode(s)) for s in anns]
-            padded = torch.stack(
-                [torch.cat([e, torch.zeros((seq_len - len(e)), dtype=torch.long)]) if len(e) < seq_len
-                else e[:seq_len]
-                for e in encodings])
-            attn_mask = (padded > 0)
-            #encoded_captions = bert(padded, attention_mask=attn_mask)[0]
-            encoded_images = resnet50(images)
-            encoded_captions = caption_encoder(padded, attn_mask)
-            loss, reg = nce(encoded_images, encoded_captions)
-            loss = loss + reg
-            optimizer.zero_grad()
-            loss.backward()
-            # print(loss)
-            # if step % 10 == 0:
-            #     wandb.log({'loss': loss})
-            optimizer.step()
-            if step > 1:
-                break
-            step += 1
+        if train_encoder:
+            for _, ((raw_imgs, images), captions) in enumerate(train_loader):
+                images = images.to(device)
+                encoded_images = resnet50(images)
+
+                # Each images has 5 captions, randomly select one of them
+                captions = captions[random.randint(0,4)]             
+                encoded_captions = caption_encoder(captions)
+
+                loss, reg = nce(encoded_images, encoded_captions)
+                loss = loss + reg
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                if step % 10 == 0:
+                    wandb.log({'loss': loss})
+                    test_queries = encoded_captions[:3]
+                    vizualize(raw_imgs, encoded_images, captions[:3], test_queries)
+                step += 1
 
         if epoch % 2 == 0 or epoch < 3:
             correct_count = 0
             total = 0
-            for fc_epoch in range(50):
+            for fc_epoch in range(15):
                 for images, labels in stl_train_loader:
                     images = images.to(device)
                     labels = labels.to(device)
-                    r1 = resnet50(images).reshape(args.b, n_rkhs)
-                    #print('shapy', r1.shape)
+                    r1 = resnet50(images).reshape(stl_batch_size, N_RKHS)
+                    r1 = r1.detach()  # we don't want the labels to impact the encoder
                     out = fc(r1)
                     class_loss = fc_loss(out, labels)
                     wandb.log({'cls loss': class_loss})
                     lin_optimizer.zero_grad()
                     class_loss.backward()
                     lin_optimizer.step()
-                    correct_count += get_correct_count(out.cpu(), labels.cpu())
-                    total += labels.size(0)
-                print('Accuracy:', correct_count / total)
+            for images, labels in stl_test_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                r1 = resnet50(images).reshape(stl_batch_size, N_RKHS)
+                out = fc(r1)
+                correct_count += get_correct_count(out.cpu(), labels.cpu())
+                total += labels.size(0)
+            print('Test Accuracy:', correct_count / total)
             wandb.log({'STL Accuracy': correct_count / total})
+
+        torch.save({    
+            'epoch': epoch,
+            'resnet50': resnet50.state_dict(),
+            'caption_fc': caption_encoder.fc.state_dict(),
+            'stl_fc': fc.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lin_optimizer': lin_optimizer.state_dict()
+        }, '{}_model.pth'.format(run_id))
             
 
 if __name__ == '__main__':
