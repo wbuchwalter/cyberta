@@ -2,6 +2,7 @@ import os
 import argparse
 from enum import Enum
 import random 
+import time
 
 from PIL import Image
 import numpy as np
@@ -66,29 +67,32 @@ def train():
 
     fc_loss = nn.CrossEntropyLoss()
     
-    train_encoder = True
     for epoch in range(500):
         print('epoch %i...' % epoch)
         step = 0
-        if train_encoder:
-            for _, ((raw_imgs, images), captions) in enumerate(train_loader):
-                images = images.to(device)
-                encoded_images = resnet50(images)
+        t0 = time.time()
+        for _, ((raw_imgs, images), captions) in enumerate(test_loader):
+            images = images.to(device)
+            # Each images has 5 captions, randomly select one of them
+            captions = captions[random.randint(0, 4)]
 
-                # Each images has 5 captions, randomly select one of them
-                captions = captions[random.randint(0,4)]             
-                encoded_captions = caption_encoder(captions)
+            encoded_images = resnet50(images)
+            encoded_captions, _ = caption_encoder(captions)
+            encoded_captions = encoded_captions.to(device)
 
-                loss, reg = nce(encoded_images, encoded_captions)
-                loss = loss + reg
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                if step % 10 == 0:
-                    wandb.log({'loss': loss})
-                    test_queries = encoded_captions[:3]
-                    vizualize(raw_imgs, encoded_images, captions[:3], test_queries)
-                step += 1
+            loss, reg = nce(encoded_images, encoded_captions)
+            loss = loss + reg
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            if step % 50 == 0:
+                wandb.log({'loss': loss})
+                test_queries = encoded_captions[:3]
+                vizualize(raw_imgs, encoded_images, captions[:3], test_queries)
+            if step % 100 == 0:
+                print('Time per step: ', (time.time() - t0) / 100.0)
+                t0 = time.time()
+            step += 1
 
         if epoch % 2 == 0 or epoch < 3:
             correct_count = 0

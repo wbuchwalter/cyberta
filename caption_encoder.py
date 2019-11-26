@@ -14,6 +14,7 @@ class CaptionEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(in_features=seq_len * 768 // 2, out_features=n_rkhs)
         )
+        self.bert.to(device)
         self.fc.to(device)
     
     def forward(self, x):
@@ -23,6 +24,7 @@ class CaptionEncoder(nn.Module):
             [torch.cat([e, torch.zeros((self.seq_len - len(e)), dtype=torch.long)]) if len(e) < self.seq_len
             else e[:self.seq_len]
             for e in encodings])
+        padded = padded.to(self.device)
         attn_mask = (padded > 0)
         word_level_rep = self.bert(padded, attention_mask=attn_mask)[0]
         out = word_level_rep.reshape(batch_size, 768 * self.seq_len)
