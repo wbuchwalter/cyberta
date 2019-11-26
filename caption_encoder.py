@@ -24,9 +24,9 @@ class CaptionEncoder(nn.Module):
             else e[:self.seq_len]
             for e in encodings])
         attn_mask = (padded > 0)
-        out = self.bert(padded, attention_mask=attn_mask)[0]
-        out = out.reshape(batch_size, 768 * self.seq_len)
+        word_level_rep = self.bert(padded, attention_mask=attn_mask)[0]
+        out = word_level_rep.reshape(batch_size, 768 * self.seq_len)
         out = out.to(self.device)
         out = out.detach() # Don't flow gradients through BERT
         out = self.fc(out)
-        return out
+        return out, word_level_rep
