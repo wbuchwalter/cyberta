@@ -2,8 +2,6 @@
 
 import torch
 
-from apex.fp16_utils import FP16_Optimizer
-
 MP_CONFIG = {
     'enabled': False,
     'optimization_level': 'O2'
@@ -23,6 +21,7 @@ def get_optim_level():
 
 
 def get_optimizer(obj):
+    from apex.fp16_utils import FP16_Optimizer
     '''
     Apex introduces the FP16_optimizer object.
     However this isn't really an optimizer, but only a wrapper around one.
