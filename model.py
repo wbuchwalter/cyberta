@@ -11,7 +11,7 @@ from utils import flatten, random_locs_2d, Flatten
 
 class ResNet50Encoder(nn.Module):
     def __init__(self, num_channels=3, ndf=64, n_rkhs=512, 
-                n_depth=3, encoder_size=32, use_bn=False):
+                 n_depth=3, encoder_size=32, use_bn=False):
         super(ResNet50Encoder, self).__init__()
         self.ndf = ndf
         self.n_rkhs = n_rkhs
