@@ -94,7 +94,7 @@ def train():
     #stl10_fc, lin_optimizer = mixed_precision.initialize(stl10_fc, lin_optimizer)
     #fc_loss = nn.CrossEntropyLoss()
     
-    for epoch in range(5000):
+    for epoch in range(500):
         print('epoch %i...' % epoch)
         step = 0
         t0 = time.time()
@@ -103,12 +103,13 @@ def train():
             # Each images has 5 captions, randomly select one of them
             captions = captions[random.randint(0, 4)]
 
-            encoded_images = resnet50(images)
+            r1, r7 = resnet50(images)
             encoded_captions, _ = caption_encoder(captions)
             encoded_captions = encoded_captions.to(device)
 
-            loss, reg = nce(encoded_images, encoded_captions)
-            loss = loss + reg
+            loss_1t1, loss_1t7, lgt_reg = nce(r1, r7, encoded_captions)
+            loss = loss_1t1 + loss_1t7 + lgt_reg
+            #loss = loss_1t1 + lgt_reg
             optimizer.zero_grad()
             mixed_precision.backward(loss, optimizer)
             #loss.backward()

@@ -36,4 +36,7 @@ class CaptionEncoder(nn.Module):
         sent_rep = sent_rep.to(self.device)
         sent_rep = sent_rep.detach()  # Don't flow gradients through BERT
         sent_rep = self.fc(sent_rep)
+
+        # ignore the [CLS] and [SEP] tokens
+        word_level_rep = word_level_rep[:, 1:-1]
         return sent_rep, word_level_rep

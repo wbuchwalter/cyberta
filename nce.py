@@ -44,14 +44,14 @@ class NCE_MI_MULTI(nn.Module):
           lgt_reg    : scalar
         '''
         batch_size = mask_mat.size(0)
-        n_locs = 1 #r_trg.size(1) // n_batch
-        n_rkhs = r_src.size(1)
+        n_locs = int(r_trg.size(1) // batch_size)
+        n_rkhs = int(r_src.size(1))
         # reshape mask_mat for ease-of-use
-        mask_pos = mask_mat.unsqueeze(dim=2).float()#.expand(-1, -1, n_locs).float()
+        mask_pos = mask_mat.unsqueeze(dim=2).expand(-1, -1, n_locs).float()
         mask_neg = 1. - mask_pos
 
         # compute src->trg raw scores for batch on this gpu
-        raw_scores = torch.mm(r_src, r_trg.t()).float()
+        raw_scores = torch.mm(r_src, r_trg).float()
         raw_scores = raw_scores.reshape(batch_size, batch_size, n_locs)
         raw_scores = raw_scores / n_rkhs**0.5
         lgt_reg = 5e-2 * (raw_scores**2.).mean()
@@ -102,12 +102,19 @@ class NCE_MI_MULTI(nn.Module):
         loss_g2l = -nce_scores.mean()
         return loss_g2l, lgt_reg
 
-    def forward(self, src, trg, mask_mat):
-        # compute costs for 1->5 prediction
-        trg = trg#[0]
-        loss, lgt_reg = self._loss_g2l(src, trg, mask_mat)
-        
-        return loss, lgt_reg
+    def forward(self, cap, r1_trg, r7_trg, mask_mat, mode="train"):
+        if mode == "train":
+            # compute costs for 1->1 prediction
+            loss_1t1, lgt_reg_1t1 = self._loss_g2l(cap, r1_trg, mask_mat)
+            # Caption 1 -> Img 7
+            loss_1t7, lgt_reg_1t7 = self._loss_g2l(cap, r7_trg, mask_mat)
+            lgt_reg = (lgt_reg_1t1 + lgt_reg_1t7)
+            return loss_1t1, loss_1t7, lgt_reg
+        else:
+            nce_scores, raw_scores, lgt_reg = \
+                self._model_scores(cap, r7_trg, mask_mat)
+            return nce_scores, raw_scores
+
 
 
 class LossMultiNCE(nn.Module):
@@ -120,8 +127,7 @@ class LossMultiNCE(nn.Module):
         self.nce_func = NCE_MI_MULTI(tclip=tclip)
         #self.nce_func = nn.DataParallel(self.nce_func)
 
-    
-    def forward(self, encoded_image, encoded_caption):
+    def forward(self, img_r1, img_r7, cap):
         '''
         Compute nce infomax costs for various combos of source/target layers.
 
@@ -133,13 +139,14 @@ class LossMultiNCE(nn.Module):
 
         # For now, we just do 'uniscale' NCE with just the final output of both 
         # ResNet50 and BERT
-        batch_size = encoded_image.size(0)
-        n_rkhs = encoded_image.size(1)
+        batch_size = img_r1.size(0)
+        n_rkhs = img_r1.size(1)
 
         # (bs, 1, 1, rkhs) -> (bs, rkhs)
-        r1_src = encoded_image.reshape(batch_size, n_rkhs)
+        r1_trg = img_r1.reshape(batch_size, n_rkhs).permute(1, 0)
+        r7_trg = img_r7.permute(1, 0, 2, 3).reshape(n_rkhs, -1)
 
-        caption_trg = encoded_caption.reshape(batch_size, n_rkhs)
+        cap = cap.reshape(batch_size, n_rkhs)
 
         # make masking matrix to help compute nce costs
         mask_mat = torch.eye(batch_size).cuda()
@@ -147,15 +154,53 @@ class LossMultiNCE(nn.Module):
         # Start with r1_x1 -> bert encodings and bert encodings -> r1_x1 ?
 
         # compute global->local scores and nce costs via nn.Dataparallel
-        n_gpus = torch.cuda.device_count()
+        #n_gpus = torch.cuda.device_count()
         #caption_trg = caption_trg.unsqueeze(dim=0).expand(n_gpus, -1, -1)
        
-        loss_1t5, lgt_reg = self.nce_func(r1_src, caption_trg, mask_mat)
+        loss_1t1, loss_1t7, lgt_reg = self.nce_func(cap, r1_trg, r7_trg, mask_mat)
 
-        return loss_1t5, lgt_reg
+        return loss_1t1, loss_1t7, lgt_reg
+    
+    def model_scores(self, cap, img_r7):
+        '''
+        Compute scores used in the NCE cost (probably for visualization?)
+        Input:
+          r_glb: (n_batch, n_rkhs)
+          r_lcl: (n_batch, n_rkhs, n_locs)
+        Output:
+          raw_scores: (n_batch, n_locs)
+          nce_scores: (n_batch, n_locs) 
+        '''
+        # make masking matrix to help compute nce costs
+        n_batch = cap.size(0)
+        n_rkhs = cap.size(1)
+        mask_mat = torch.eye(n_batch).cuda()
+        # account for use of nn.DataParallel
+        n_gpus = torch.cuda.device_count()
+        img_r7 = img_r7.permute(1, 0, 2).reshape(n_rkhs, -1)
+        #img_r7 = img_r7.unsqueeze(dim=0).expand(n_gpus, -1, -1)
+        # compute raw scores and log-softmax NCE scores
+        nce_scores, raw_scores = \
+            self.nce_func(cap, img_r7, img_r7, mask_mat, mode='viz')
+        return nce_scores, raw_scores
 
 
 def nce_retrieval(encoded_images, encoded_queries, top_k=5):
+    batch_size = encoded_images.size(0)
+    n_rkhs = encoded_images.size(1)
+    n_queries = encoded_queries.size(0)
+
+    # (bs, 1, 1, rkhs) -> (bs, rkhs)
+    encoded_images = encoded_images.reshape(batch_size, n_rkhs)
+    encoded_images = F.normalize(encoded_images)
+
+    scores = torch.mm(encoded_queries, encoded_images.t())
+    cos_sims_idx = torch.sort(scores, dim=1, descending=True)[1]
+    cos_sis_idx = torch.flatten(cos_sims_idx[:, :top_k])
+    return cos_sis_idx
+
+
+def nce_retrieval_multiscale(cap, img_r1, img_r7, top_k=5):
     batch_size = encoded_images.size(0)
     n_rkhs = encoded_images.size(1)
     n_queries = encoded_queries.size(0)

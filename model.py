@@ -115,8 +115,54 @@ class ResNet50Encoder(nn.Module):
         # gather rkhs embeddings from certain layers
         r1 = self.rkhs_block_1(acts[self.dim2layer[1]])
         #r5 = self.rkhs_block_5(acts[self.dim2layer[5]])
-        #r7 = self.rkhs_block_7(acts[self.dim2layer[7]])
-        return r1 #, r5, r7
+        r7 = self.rkhs_block_7(acts[self.dim2layer[7]])
+        return r1, r7
+
+
+    def _g2l_heatmap(self, cap, img_r7):
+        '''
+        Compute score heatmaps for visualizing global->local predictions.
+        '''
+        n_batch = 1
+        n_rkhs = cap.size(1)
+        n_dim = img_r7.size(2)
+        # do some casts to deal with mixed-precision
+        cap = cap.float().cuda()
+        img_r7 = img_r7.float().cuda()
+        # prepare global and local features for score computation
+        #r_glb = (glb_mask * r_glb).sum(dim=3).sum(dim=2)  # (n_batch, n_rkhs)
+        img_r7 = img_r7.reshape(n_batch, n_rkhs, -1)        # (n_batch, n_rkhs, n_locs)
+        # compute scores used in NCE
+        from nce import LossMultiNCE
+        g2l_loss = LossMultiNCE().to('cuda')
+        nce_scores, raw_scores = g2l_loss.model_scores(cap, img_r7)
+        # shift and scale for heatmaps normalized to [0, 1], and then reshape
+        nce_scores = nce_scores - torch.min(nce_scores, dim=1, keepdim=True)[0]
+        nce_scores = nce_scores / torch.max(nce_scores, dim=1, keepdim=True)[0]
+        nce_scores = nce_scores.reshape(n_batch, n_dim, n_dim).unsqueeze(dim=1)
+        # shift and scale for heatmaps normalized to [0, 1], and then reshape
+        raw_scores = raw_scores - torch.min(raw_scores, dim=1, keepdim=True)[0]
+        raw_scores = raw_scores / torch.max(raw_scores, dim=1, keepdim=True)[0]
+        raw_scores = raw_scores.reshape(n_batch, n_dim, n_dim).unsqueeze(dim=1)
+        return nce_scores, raw_scores
+
+    def visualize(self, cap, img_r7):
+        '''
+        Compute model visualizations using this pair of global/local inputs.
+        x_glb : images to encode for global features
+        x_lcl : images to encode for local features
+        '''
+
+        n_batch = 1#x_glb.size(0)
+        # compute g2l score heatmaps for 1t7 
+        hmap_1t7_nce, hmap_1t7_raw = self._g2l_heatmap(cap, img_r7)
+        # merge heatmaps that show location of global feature and the
+        # scores for all global->local predictions
+        viz_1t7_nce = torch.cat([0.0 * hmap_1t7_nce, hmap_1t7_nce.expand(-1, 2, -1, -1)], dim=1)
+        viz_1t7_raw = torch.cat([0.0 * hmap_1t7_raw, hmap_1t7_raw.expand(-1, 2, -1, -1)], dim=1)
+        viz_1t7_nce = viz_1t7_nce.detach().cpu()
+        viz_1t7_raw = viz_1t7_raw.detach().cpu()
+        return viz_1t7_nce, viz_1t7_raw
 
 
 class MaybeBatchNorm2d(nn.Module):
