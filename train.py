@@ -20,7 +20,7 @@ from caption_encoder import CaptionEncoder
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--cap_fc_size', type=int, default=4096)
-parser.add_argument('--cap_seq_len', type=int, default=20)
+parser.add_argument('--cap_seq_len', type=int, default=25)
 parser.add_argument('--batch_size', type=int, default=200,
                     help='input batch size (default: 200)')
 parser.add_argument('--learning_rate', type=float, default=0.0002,
@@ -69,26 +69,32 @@ def train():
     # enable mixed-precision computation if desired
     if args.amp:
         mixed_precision.enable_mixed_precision()
-
+    
     stl_batch_size = 400    
     train_loader, test_loader, stl_train_loader, stl_test_loader = build_dataset(args.batch_size, stl_batch_size)
 
     caption_encoder = CaptionEncoder(args.n_rkhs, args.cap_seq_len, hidden_size=args.cap_fc_size, device=device)
     resnet50 = ResNet50Encoder(encoder_size=128, n_rkhs=args.n_rkhs, ndf=args.ndf, n_depth=args.n_depth)
     resnet50.init_weights()
-    resnet50.to(device)
+    resnet50 = resnet50.to(device)
 
-    stl10_fc = nn.Linear(in_features=args.n_rkhs, out_features=10)
-    stl10_fc = stl10_fc.to(device)
+    #stl10_fc = nn.Linear(in_features=args.n_rkhs, out_features=10)
+    #stl10_fc = stl10_fc.to(device)
 
     optimizer = torch.optim.Adam(
-        [{'params': mod.parameters(), 'lr': args.learning_rate} for mod in [caption_encoder.fc, resnet50]],
+        [{'params': mod.parameters(), 'lr': args.learning_rate} for mod in [caption_encoder.conv, resnet50]],
         betas=(0.8, 0.999), weight_decay=1e-5, eps=1e-8)
     nce = LossMultiNCE().to(device)
 
-    lin_optimizer = torch.optim.Adam([
-        {'params': stl10_fc.parameters()}
-    ])
+    # lin_optimizer = torch.optim.Adam([
+    #     {'params': stl10_fc.parameters()}
+    # ])
+
+    if args.cpt_load_path is not None:
+        ckpt = torch.load(args.cpt_load_path)
+        resnet50.load_state_dict(ckpt['resnet50'])
+        caption_encoder.conv.load_state_dict(ckpt['caption_conv'])
+        print('Checkpoint loaded.')
 
     resnet50, optimizer = mixed_precision.initialize(resnet50, optimizer)
     #stl10_fc, lin_optimizer = mixed_precision.initialize(stl10_fc, lin_optimizer)
@@ -104,24 +110,49 @@ def train():
             captions = captions[random.randint(0, 4)]
 
             r1, r7 = resnet50(images)
-            encoded_captions, _ = caption_encoder(captions)
+            encoded_captions, word_reps = caption_encoder(captions)
             encoded_captions = encoded_captions.to(device)
 
-            loss_1t1, loss_1t7, lgt_reg = nce(r1, r7, encoded_captions)
-            loss = loss_1t1 + loss_1t7 + lgt_reg
+            loss_gtg, loss_gtl, loss_ltl, lgt_reg = nce(r1, r7, encoded_captions, word_reps)
+            loss = loss_gtg + loss_gtl + loss_ltl + lgt_reg
             #loss = loss_1t1 + lgt_reg
             optimizer.zero_grad()
             mixed_precision.backward(loss, optimizer)
             #loss.backward()
             optimizer.step()
             if step % 50 == 0:
-                wandb.log({'loss': loss})
+                wandb.log({
+                    'loss': loss,
+                    'loss_gtg': loss_gtg,
+                    'loss_gtl': loss_gtl,
+                    'loss_ltl': loss_ltl
+                })
+
                 # test_queries = encoded_captions[:3]
                 # vizualize(raw_imgs, encoded_images, captions[:3], test_queries)
             if step % 100 == 0:
                 print('Time per step: ', (time.time() - t0) / 100.0)
                 t0 = time.time()
             step += 1
+        # Test:
+        # For each image, retrieve top 5 captions and check if the actual one is in there
+        # For each caption, retrieve top 5 images and check if actual one is in there
+
+        correct = 0
+        total = 0
+        for _, ((raw_imgs, images), captions) in enumerate(test_loader):
+            images = images.to(device)
+            captions = captions[random.randint(0, 4)]
+            r1, r7 = resnet50(images)
+            encoded_captions, word_reps = caption_encoder(captions)
+            encoded_captions = encoded_captions.to(device)
+            # (batch_size, 5)
+            cos_sims_idx = nce_retrieval(r1, encoded_captions)
+            y = torch.arange(0, images.size(0))
+            correct += (cos_sims_idx.cpu().t() == y).sum().item()    
+            total += images.size(0)
+        print('Epoch {}, test top-5 retrieval accuracy: {}'.format(epoch, correct / total))
+        wandb.log({'test_top_5': correct / total})
 
         # if epoch % 3 == 0:
         #     correct_count = 0
@@ -152,10 +183,10 @@ def train():
         torch.save({    
             'epoch': epoch,
             'resnet50': resnet50.state_dict(),
-            'caption_fc': caption_encoder.fc.state_dict(),
-            'stl_fc': stl10_fc.state_dict(),
+            'caption_conv': caption_encoder.conv.state_dict(),
+            #'stl_fc': stl10_fc.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'lin_optimizer': lin_optimizer.state_dict()
+            #'lin_optimizer': lin_optimizer.state_dict()
         }, 'checkpoints/{}_model.pth'.format(run_id))
             
 

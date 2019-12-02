@@ -101,18 +101,27 @@ class NCE_MI_MULTI(nn.Module):
             self._model_scores(r_src, r_trg, mask_mat)
         loss_g2l = -nce_scores.mean()
         return loss_g2l, lgt_reg
-
-    def forward(self, cap, r1_trg, r7_trg, mask_mat, mode="train"):
+    
+    def forward(self, cap_src, word_src, all_words_trg, r7_src, r1_trg, r7_trg, mask_mat, mode="train"):
         if mode == "train":
-            # compute costs for 1->1 prediction
-            loss_1t1, lgt_reg_1t1 = self._loss_g2l(cap, r1_trg, mask_mat)
+            # compute costs for caption 1-> image 1 prediction
+            loss_gtg, lgt_reg_gtg = self._loss_g2l(cap_src, r1_trg, mask_mat)
             # Caption 1 -> Img 7
-            loss_1t7, lgt_reg_1t7 = self._loss_g2l(cap, r7_trg, mask_mat)
-            lgt_reg = (lgt_reg_1t1 + lgt_reg_1t7)
-            return loss_1t1, loss_1t7, lgt_reg
+            loss_gtl_1, lgt_reg_gtl_1 = self._loss_g2l(cap_src, r7_trg, mask_mat)
+            loss_gtl_2, lgt_reg_gtl_2 = self._loss_g2l(r1_trg.t(), all_words_trg, mask_mat)
+
+            # Word -> Img 7
+            loss_ltl_1, lgt_reg_ltl_1 = self._loss_g2l(word_src, r7_trg, mask_mat)
+            loss_ltl_2, lgt_reg_ltl_2 = self._loss_g2l(r7_src, all_words_trg, mask_mat)
+            
+            loss_gtl = 0.5 * (loss_gtl_1 + loss_gtl_2)
+            loss_ltl = 0.5 * (loss_ltl_1 + loss_ltl_2)
+
+            lgt_reg = lgt_reg_gtg + 0.5 * (lgt_reg_gtl_1 + lgt_reg_gtl_2 + lgt_reg_ltl_1 + lgt_reg_ltl_2)
+            return loss_gtg, loss_gtl, loss_ltl, lgt_reg
         else:
             nce_scores, raw_scores, lgt_reg = \
-                self._model_scores(cap, r7_trg, mask_mat)
+                self._model_scores(cap_src, r7_trg, mask_mat)
             return nce_scores, raw_scores
 
 
@@ -126,15 +135,38 @@ class LossMultiNCE(nn.Module):
         # initialize the dataparallel nce computer (magic!)
         self.nce_func = NCE_MI_MULTI(tclip=tclip)
         #self.nce_func = nn.DataParallel(self.nce_func)
+    
+    def _sample_src_ftr(self, r_cnv, masks):
+        # get feature dimensions
+        n_batch = r_cnv.size(0)
+        n_rkhs = r_cnv.size(1)
+        if masks is not None:
+            # subsample from conv-ish r_cnv to get a single vector
+            mask_idx = torch.randint(0, masks.size(0), (n_batch,))
+            r_cnv = torch.masked_select(r_cnv, masks[mask_idx])
+        # flatten features for use as globals in glb->lcl nce cost
+        r_vec = r_cnv.reshape(n_batch, n_rkhs)
+        return r_vec
+    
+    def _build_masking_mat(self, dim):
+        masks = np.zeros((dim, dim, 1, dim, dim))
+        for i in range(dim):
+            for j in range(dim):
+                masks[i, j, 0, i, j] = 1
+        masks = torch.tensor(masks).type(torch.uint8)
+        masks = masks.reshape(-1, 1, dim, dim)
+        return masks
 
-    def forward(self, img_r1, img_r7, cap):
+    def forward(self, img_r1, img_r7, cap, words):
         '''
         Compute nce infomax costs for various combos of source/target layers.
 
         Compute costs in both directions, i.e. from/to both images (x1, x2).
 
-        rK_x1 are features from source image x1.
-        rK_x2 are features from source image x2.
+        img_r1 are global encodings from source image.
+        img_r7 are 7*7 local encodings from source image.
+        cap are global encodings from captions.
+        words are local (word-level) encodings from captions.
         '''
 
         # For now, we just do 'uniscale' NCE with just the final output of both 
@@ -142,9 +174,17 @@ class LossMultiNCE(nn.Module):
         batch_size = img_r1.size(0)
         n_rkhs = img_r1.size(1)
 
+        mask_r7 = self._build_masking_mat(7).to('cuda')
+        r7_src = self._sample_src_ftr(img_r7, mask_r7)
+        # TODO: This will only work of seq_len is 25, fix that
+        mask_words = self._build_masking_mat(5).to('cuda')
+        words = words.reshape([batch_size, 5, 5, n_rkhs]).permute(0, 3, 1, 2)
+        word_src = self._sample_src_ftr(words, mask_words)
+
         # (bs, 1, 1, rkhs) -> (bs, rkhs)
         r1_trg = img_r1.reshape(batch_size, n_rkhs).permute(1, 0)
         r7_trg = img_r7.permute(1, 0, 2, 3).reshape(n_rkhs, -1)
+        words = words.permute(1, 0, 2, 3).reshape(n_rkhs, -1)
 
         cap = cap.reshape(batch_size, n_rkhs)
 
@@ -157,9 +197,10 @@ class LossMultiNCE(nn.Module):
         #n_gpus = torch.cuda.device_count()
         #caption_trg = caption_trg.unsqueeze(dim=0).expand(n_gpus, -1, -1)
        
-        loss_1t1, loss_1t7, lgt_reg = self.nce_func(cap, r1_trg, r7_trg, mask_mat)
+        #loss_1t1, loss_1t7, lgt_reg = self.nce_func(r1_trg, r7_trg, cap, words, mask_mat)
+        loss_gtg, loss_gtl, loss_ltl, lgt_reg = self.nce_func(cap, word_src, words, r7_src, r1_trg, r7_trg, mask_mat)
 
-        return loss_1t1, loss_1t7, lgt_reg
+        return loss_gtg, loss_gtl, loss_ltl, lgt_reg
     
     def model_scores(self, cap, img_r7):
         '''
@@ -181,7 +222,7 @@ class LossMultiNCE(nn.Module):
         #img_r7 = img_r7.unsqueeze(dim=0).expand(n_gpus, -1, -1)
         # compute raw scores and log-softmax NCE scores
         nce_scores, raw_scores = \
-            self.nce_func(cap, img_r7, img_r7, mask_mat, mode='viz')
+            self.nce_func(cap, None, None, None, None, img_r7, mask_mat, mode='viz')
         return nce_scores, raw_scores
 
 
@@ -196,8 +237,8 @@ def nce_retrieval(encoded_images, encoded_queries, top_k=5):
 
     scores = torch.mm(encoded_queries, encoded_images.t())
     cos_sims_idx = torch.sort(scores, dim=1, descending=True)[1]
-    cos_sis_idx = torch.flatten(cos_sims_idx[:, :top_k])
-    return cos_sis_idx
+    #cos_sims_idx = torch.flatten(cos_sims_idx[:, :top_k])
+    return cos_sims_idx[:, :top_k]
 
 
 def nce_retrieval_multiscale(cap, img_r1, img_r7, top_k=5):
@@ -211,5 +252,5 @@ def nce_retrieval_multiscale(cap, img_r1, img_r7, top_k=5):
 
     scores = torch.mm(encoded_queries, encoded_images.t())
     cos_sims_idx = torch.sort(scores, dim=1, descending=True)[1]
-    cos_sis_idx = cos_sims_idx[:, :top_k]
-    return cos_sis_idx
+    cos_sims_idx = cos_sims_idx[:, :top_k]
+    return cos_sims_idx
