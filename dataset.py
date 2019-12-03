@@ -47,21 +47,22 @@ class Transforms128:
         return orig, out1
 
 
-def build_dataset(batch_size: int, stl_batch_size: int):
+def get_dataset(dataset: str, batch_size: int):
     transforms128 = Transforms128()
-    train_dataset = datasets.CocoCaptions(
-                                    root=os.path.expanduser('~/data/coco/train2017'), 
-                                    annFile=os.path.expanduser('~/data/coco/annotations/captions_train2017.json'), 
-                                    transform=transforms128)
-    
-    print('WARNING: test dataset is using train transforms')
-    test_dataset = datasets.CocoCaptions(
-                                    root=os.path.expanduser('~/data/coco/val2017'), 
-                                    annFile=os.path.expanduser('~/data/coco/annotations/captions_val2017.json'), 
-                                    transform=transforms128)
-    
-    stl_train_dataset = datasets.STL10(root=os.path.expanduser('~/data'), transform=transforms128.test_transform)
-    stl_test_dataset = datasets.STL10(root=os.path.expanduser('~/data'), transform=transforms128.test_transform, split='test')
+    if dataset == 'coco':
+        train_dataset = datasets.CocoCaptions(
+                                        root=os.path.expanduser('~/data/coco/train2017'), 
+                                        annFile=os.path.expanduser('~/data/coco/annotations/captions_train2017.json'), 
+                                        transform=transforms128)
+        
+        print('WARNING: test dataset is using train transforms')
+        test_dataset = datasets.CocoCaptions(
+                                        root=os.path.expanduser('~/data/coco/val2017'), 
+                                        annFile=os.path.expanduser('~/data/coco/annotations/captions_val2017.json'), 
+                                        transform=transforms128)
+    elif dataset == 'stl10':
+        train_dataset = datasets.STL10(root=os.path.expanduser('~/data'), transform=transforms128.test_transform)
+        test_dataset = datasets.STL10(root=os.path.expanduser('~/data'), transform=transforms128.test_transform, split='test')
 
 
     # build pytorch dataloaders for the datasets
@@ -80,21 +81,4 @@ def build_dataset(batch_size: int, stl_batch_size: int):
                                     drop_last=True,
                                     num_workers=16)
     
-    stl_train_loader = \
-        torch.utils.data.DataLoader(dataset=stl_train_dataset,
-                                    batch_size=stl_batch_size,
-                                    shuffle=True,
-                                    pin_memory=True,
-                                    drop_last=True,
-                                    num_workers=16)
-    
-    stl_test_loader = \
-        torch.utils.data.DataLoader(dataset=stl_train_dataset,
-                                    batch_size=stl_batch_size,
-                                    shuffle=True,
-                                    pin_memory=True,
-                                    drop_last=True,
-                                    num_workers=16)
-
-    return train_loader, test_loader, stl_train_loader, stl_test_loader
-
+    return train_loader, test_loader

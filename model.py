@@ -11,58 +11,30 @@ from utils import flatten, random_locs_2d, Flatten
 
 class ResNet50Encoder(nn.Module):
     def __init__(self, num_channels=3, ndf=64, n_rkhs=512, 
-                 n_depth=3, encoder_size=32, use_bn=False):
+                 n_depth=3, use_bn=False):
         super(ResNet50Encoder, self).__init__()
         self.ndf = ndf
         self.n_rkhs = n_rkhs
         self.use_bn = use_bn
         self.dim2layer = None
-
+        
+        encoder_size = 128
         dummy_batch = torch.zeros((2, 3, encoder_size, encoder_size))
 
-        # encoding block for local features
-        print('Using a {}x{} encoder'.format(encoder_size, encoder_size))
-        if encoder_size == 32:
-            self.layer_list = nn.ModuleList([
-                Conv3x3(num_channels, ndf, 3, 1, 0, False),
-                ConvResNxN(ndf, ndf, 1, 1, 0, use_bn),
-                ConvResBlock(ndf * 1, ndf * 2, 4, 2, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 2, ndf * 4, 2, 2, 0, n_depth, use_bn),
-                MaybeBatchNorm2d(ndf * 4, True, use_bn),
-                ConvResBlock(ndf * 4, ndf * 4, 3, 1, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 4, ndf * 4, 3, 1, 0, n_depth, use_bn),
-                ConvResNxN(ndf * 4, n_rkhs, 3, 1, 0, use_bn),
-                MaybeBatchNorm2d(n_rkhs, True, True)
-            ])
-        elif encoder_size == 64:
-            self.layer_list = nn.ModuleList([
-                Conv3x3(num_channels, ndf, 3, 1, 0, False),
-                ConvResBlock(ndf * 1, ndf * 2, 4, 2, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 2, ndf * 4, 4, 2, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 4, ndf * 8, 2, 2, 0, n_depth, use_bn),
-                MaybeBatchNorm2d(ndf * 8, True, use_bn),
-                ConvResBlock(ndf * 8, ndf * 8, 3, 1, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 8, ndf * 8, 3, 1, 0, n_depth, use_bn),
-                ConvResNxN(ndf * 8, n_rkhs, 3, 1, 0, use_bn),
-                MaybeBatchNorm2d(n_rkhs, True, True)
-            ])
-        elif encoder_size == 128:
-            self.layer_list = nn.ModuleList([
-                Conv3x3(num_channels, ndf, 5, 2, 2, False, pad_mode='reflect'),
-                Conv3x3(ndf, ndf, 3, 1, 0, False),
-                ConvResBlock(ndf * 1, ndf * 2, 4, 2, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 2, ndf * 4, 4, 2, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 4, ndf * 8, 2, 2, 0, n_depth, use_bn),
-                MaybeBatchNorm2d(ndf * 8, True, use_bn),
-                ConvResBlock(ndf * 8, ndf * 8, 3, 1, 0, n_depth, use_bn),
-                ConvResBlock(ndf * 8, ndf * 8, 3, 1, 0, n_depth, use_bn),
-                ConvResNxN(ndf * 8, n_rkhs, 3, 1, 0, use_bn),
-                MaybeBatchNorm2d(n_rkhs, True, True)
-            ])
-        else:
-            raise RuntimeError("Could not build encoder."
-                               "Encoder size {} is not supported".format(encoder_size))
+        self.layer_list = nn.ModuleList([
+            Conv3x3(num_channels, ndf, 5, 2, 2, False, pad_mode='reflect'),
+            Conv3x3(ndf, ndf, 3, 1, 0, False),
+            ConvResBlock(ndf * 1, ndf * 2, 4, 2, 0, n_depth, use_bn),
+            ConvResBlock(ndf * 2, ndf * 4, 4, 2, 0, n_depth, use_bn),
+            ConvResBlock(ndf * 4, ndf * 8, 2, 2, 0, n_depth, use_bn),
+            MaybeBatchNorm2d(ndf * 8, True, use_bn),
+            ConvResBlock(ndf * 8, ndf * 8, 3, 1, 0, n_depth, use_bn),
+            ConvResBlock(ndf * 8, ndf * 8, 3, 1, 0, n_depth, use_bn),
+            ConvResNxN(ndf * 8, n_rkhs, 3, 1, 0, use_bn),
+            MaybeBatchNorm2d(n_rkhs, True, True)
+        ])
         self._config_modules(dummy_batch, [1, 5, 7], n_rkhs, use_bn)
+        self.init_weights()
 
     def init_weights(self, init_scale=1.):
         '''

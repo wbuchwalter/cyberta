@@ -14,7 +14,7 @@ import wandb
 
 import mixed_precision
 from model import ResNet50Encoder
-from dataset import build_dataset
+from dataset import get_dataset
 from nce import LossMultiNCE, nce_retrieval
 from caption_encoder import CaptionEncoder
 
@@ -65,30 +65,37 @@ def vizualize(raw_images, encoded_images, raw_queries, encoded_queries):
     wandb.log({'viz': wandb.Image(viz)})
     wandb.log({'queries': wandb.Table(data=raw_queries, columns=['Query'])})
 
+
+def test_coco_retrieval(test_loader, resnet, caption_encoder):
+    correct = 0
+    total = 0
+    for _, ((_, images), captions) in enumerate(test_loader):
+        images = images.to(device)
+        captions = captions[random.randint(0, 4)]
+        r1, _ = resnet50(images)
+        encoded_captions, _ = caption_encoder(captions)
+        encoded_captions = encoded_captions.to(device)
+        # (batch_size, 5)
+        cos_sims_idx = nce_retrieval(r1, encoded_captions)
+        y = torch.arange(0, images.size(0))
+        correct += (cos_sims_idx.cpu().t() == y).sum().item()    
+        total += images.size(0)
+    return correct / total
+    
 def train():
     # enable mixed-precision computation if desired
     if args.amp:
         mixed_precision.enable_mixed_precision()
     
-    stl_batch_size = 400    
-    train_loader, test_loader, stl_train_loader, stl_test_loader = build_dataset(args.batch_size, stl_batch_size)
-
+    train_loader, test_loader = get_dataset('coco', args.batch_size)
     caption_encoder = CaptionEncoder(args.n_rkhs, args.cap_seq_len, hidden_size=args.cap_fc_size, device=device)
-    resnet50 = ResNet50Encoder(encoder_size=128, n_rkhs=args.n_rkhs, ndf=args.ndf, n_depth=args.n_depth)
-    resnet50.init_weights()
+    resnet50 = ResNet50Encoder(n_rkhs=args.n_rkhs, ndf=args.ndf, n_depth=args.n_depth)
     resnet50 = resnet50.to(device)
-
-    #stl10_fc = nn.Linear(in_features=args.n_rkhs, out_features=10)
-    #stl10_fc = stl10_fc.to(device)
 
     optimizer = torch.optim.Adam(
         [{'params': mod.parameters(), 'lr': args.learning_rate} for mod in [caption_encoder.conv, resnet50]],
         betas=(0.8, 0.999), weight_decay=1e-5, eps=1e-8)
     nce = LossMultiNCE().to(device)
-
-    # lin_optimizer = torch.optim.Adam([
-    #     {'params': stl10_fc.parameters()}
-    # ])
 
     if args.cpt_load_path is not None:
         ckpt = torch.load(args.cpt_load_path)
@@ -97,9 +104,10 @@ def train():
         print('Checkpoint loaded.')
 
     resnet50, optimizer = mixed_precision.initialize(resnet50, optimizer)
-    #stl10_fc, lin_optimizer = mixed_precision.initialize(stl10_fc, lin_optimizer)
-    #fc_loss = nn.CrossEntropyLoss()
-    
+
+    top_5_accuracy = test_coco_retrieval(test_loader, resnet50, caption_encoder)
+    print('Before training, test top-5 retrieval accuracy: {}'.format(epoch,top_5_accuracy))    
+
     for epoch in range(500):
         print('epoch %i...' % epoch)
         step = 0
@@ -115,10 +123,8 @@ def train():
 
             loss_gtg, loss_gtl, loss_ltl, lgt_reg = nce(r1, r7, encoded_captions, word_reps)
             loss = loss_gtg + loss_gtl + loss_ltl + lgt_reg
-            #loss = loss_1t1 + lgt_reg
             optimizer.zero_grad()
             mixed_precision.backward(loss, optimizer)
-            #loss.backward()
             optimizer.step()
             if step % 50 == 0:
                 wandb.log({
@@ -130,64 +136,23 @@ def train():
 
                 # test_queries = encoded_captions[:3]
                 # vizualize(raw_imgs, encoded_images, captions[:3], test_queries)
-            if step % 100 == 0:
+            if step % 100 == 99:
                 print('Time per step: ', (time.time() - t0) / 100.0)
                 t0 = time.time()
             step += 1
-        # Test:
-        # For each image, retrieve top 5 captions and check if the actual one is in there
-        # For each caption, retrieve top 5 images and check if actual one is in there
 
-        correct = 0
-        total = 0
-        for _, ((raw_imgs, images), captions) in enumerate(test_loader):
-            images = images.to(device)
-            captions = captions[random.randint(0, 4)]
-            r1, r7 = resnet50(images)
-            encoded_captions, word_reps = caption_encoder(captions)
-            encoded_captions = encoded_captions.to(device)
-            # (batch_size, 5)
-            cos_sims_idx = nce_retrieval(r1, encoded_captions)
-            y = torch.arange(0, images.size(0))
-            correct += (cos_sims_idx.cpu().t() == y).sum().item()    
-            total += images.size(0)
-        print('Epoch {}, test top-5 retrieval accuracy: {}'.format(epoch, correct / total))
-        wandb.log({'test_top_5': correct / total})
+        top_5_accuracy = test_coco_retrieval(test_loader, resnet50, caption_encoder)
+        print('Epoch {}, test top-5 retrieval accuracy: {}'.format(epoch,top_5_accuracy))
+        wandb.log({'test_top_5': top_5_accuracy})
 
-        # if epoch % 3 == 0:
-        #     correct_count = 0
-        #     total = 0
-        #     for fc_epoch in range(15):
-        #         for images, labels in stl_train_loader:
-        #             images = images.to(device)
-        #             labels = labels.to(device)
-        #             r1 = resnet50(images).reshape(stl_batch_size, args.n_rkhs)
-        #             r1 = r1.detach()  # we don't want the labels to impact the encoder
-        #             out = stl10_fc(r1)
-        #             class_loss = fc_loss(out, labels)
-        #             wandb.log({'cls loss': class_loss})
-        #             lin_optimizer.zero_grad()
-        #             class_loss.backward()
-        #             lin_optimizer.step()
-        #     for images, labels in stl_test_loader:
-        #         images = images.to(device)
-        #         labels = labels.to(device)
-        #         r1 = resnet50(images).reshape(stl_batch_size, args.n_rkhs)
-        #         out = stl10_fc(r1)
-        #         correct_count += get_correct_count(out.cpu(), labels.cpu())
-        #         total += labels.size(0)
-        #     print('Test Accuracy:', correct_count / total)
-        #     wandb.log({'STL Accuracy': correct_count / total})
-
-        os.makedirs('./checkpoints', exist_ok=True)
-        torch.save({    
-            'epoch': epoch,
-            'resnet50': resnet50.state_dict(),
-            'caption_conv': caption_encoder.conv.state_dict(),
-            #'stl_fc': stl10_fc.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            #'lin_optimizer': lin_optimizer.state_dict()
-        }, 'checkpoints/{}_model.pth'.format(run_id))
+        if epoch % 5 == 0:
+            os.makedirs('./checkpoints', exist_ok=True)
+            torch.save({    
+                'epoch': epoch,
+                'resnet50': resnet50.state_dict(),
+                'caption_conv': caption_encoder.conv.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }, 'checkpoints/{}_model.pth'.format(run_id))
             
 
 if __name__ == '__main__':
