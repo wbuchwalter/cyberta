@@ -9,10 +9,10 @@ from mixed_precision import maybe_half
 from utils import flatten, random_locs_2d, Flatten
 
 
-class ResNet50Encoder(nn.Module):
+class Encoder(nn.Module):
     def __init__(self, num_channels=3, ndf=64, n_rkhs=512, 
                  n_depth=3, use_bn=False):
-        super(ResNet50Encoder, self).__init__()
+        super(Encoder, self).__init__()
         self.ndf = ndf
         self.n_rkhs = n_rkhs
         self.use_bn = use_bn

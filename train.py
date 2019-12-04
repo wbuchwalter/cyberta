@@ -13,7 +13,7 @@ from torchvision.utils import make_grid
 import wandb
 
 import mixed_precision
-from model import ResNet50Encoder
+from model import Encoder
 from dataset import get_dataset
 from nce import LossMultiNCE, nce_retrieval
 from caption_encoder import CaptionEncoder
@@ -66,7 +66,7 @@ def vizualize(raw_images, encoded_images, raw_queries, encoded_queries):
     wandb.log({'queries': wandb.Table(data=raw_queries, columns=['Query'])})
 
 
-def test_coco_retrieval(test_loader, resnet, caption_encoder):
+def test_coco_retrieval(test_loader, resnet50, caption_encoder):
     correct = 0
     total = 0
     for _, ((_, images), captions) in enumerate(test_loader):
@@ -81,7 +81,7 @@ def test_coco_retrieval(test_loader, resnet, caption_encoder):
         correct += (cos_sims_idx.cpu().t() == y).sum().item()    
         total += images.size(0)
     return correct / total
-    
+
 def train():
     # enable mixed-precision computation if desired
     if args.amp:
@@ -89,11 +89,10 @@ def train():
     
     train_loader, test_loader = get_dataset('coco', args.batch_size)
     caption_encoder = CaptionEncoder(args.n_rkhs, args.cap_seq_len, hidden_size=args.cap_fc_size, device=device)
-    resnet50 = ResNet50Encoder(n_rkhs=args.n_rkhs, ndf=args.ndf, n_depth=args.n_depth)
-    resnet50 = resnet50.to(device)
-
+    resnet50 = Encoder(n_rkhs=args.n_rkhs, ndf=args.ndf, n_depth=args.n_depth)
+    
     optimizer = torch.optim.Adam(
-        [{'params': mod.parameters(), 'lr': args.learning_rate} for mod in [caption_encoder.conv, resnet50]],
+        [{'params': mod.parameters(), 'lr': args.learning_rate} for mod in [caption_encoder.conv]],
         betas=(0.8, 0.999), weight_decay=1e-5, eps=1e-8)
     nce = LossMultiNCE().to(device)
 
@@ -103,10 +102,16 @@ def train():
         caption_encoder.conv.load_state_dict(ckpt['caption_conv'])
         print('Checkpoint loaded.')
 
+    resnet50 = resnet50.to(device)
     resnet50, optimizer = mixed_precision.initialize(resnet50, optimizer)
 
+    caption_encoder.conv, _ = mixed_precision.initialize(caption_encoder.conv, None)
+
+    for param in resnet50.parameters():
+        param.requires_grad = False
+
     top_5_accuracy = test_coco_retrieval(test_loader, resnet50, caption_encoder)
-    print('Before training, test top-5 retrieval accuracy: {}'.format(epoch,top_5_accuracy))    
+    print('Before training, test top-5 retrieval accuracy: {}'.format(top_5_accuracy))    
 
     for epoch in range(500):
         print('epoch %i...' % epoch)
